@@ -23,6 +23,7 @@
 module Simplex.Chat.Types where
 
 import Control.Applicative (optional, (<|>))
+import Control.Monad.Validate (MonadValidate (..))
 import Crypto.Number.Serialize (os2ip)
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.=))
 import qualified Data.Aeson as J
@@ -35,6 +36,8 @@ import Data.ByteString.Char8 (ByteString, pack, unpack)
 import qualified Data.ByteString.Char8 as B
 import Data.Int (Int64)
 import Data.Maybe (isJust)
+import Data.MessagePack (MessagePack (..))
+import qualified Data.MessagePack as MP
 import Data.String (IsString (..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -580,6 +583,13 @@ instance FromJSON GroupLinkId where
 instance ToJSON GroupLinkId where
   toJSON = strToJSON
   toEncoding = strToJEncoding
+
+instance MessagePack ImageData where
+  toObject _ (ImageData d) = MP.ObjectBin d
+  fromObjectWith _ = \case
+    MP.ObjectBin d -> pure $ ImageData d
+    MP.ObjectStr t -> either (refute . MP.decodeError) pure $ strDecode $ encodeUtf8 t
+    _ -> refute "invalid encoding for ImageData"
 
 data GroupInvitation = GroupInvitation
   { fromMember :: MemberIdRole,

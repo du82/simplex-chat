@@ -1,11 +1,13 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -19,25 +21,34 @@ module Simplex.Chat.Protocol where
 
 import Control.Applicative ((<|>))
 import Control.Monad ((<=<))
+import Control.Monad.Validate (MonadValidate (..))
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=))
 import qualified Data.Aeson as J
 import qualified Data.Aeson.Encoding as JE
+import qualified Data.Aeson.Key as JK
 import qualified Data.Aeson.KeyMap as JM
 import qualified Data.Aeson.TH as JQ
 import qualified Data.Aeson.Types as JT
 import qualified Data.Attoparsec.ByteString.Char8 as A
+import Data.Bifunctor (bimap)
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Internal (c2w, w2c)
 import qualified Data.ByteString.Lazy.Char8 as LB
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe)
+import Data.MessagePack (MessagePack (..))
+import qualified Data.MessagePack as MP
+import Data.Scientific (floatingOrInteger)
 import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text.Encoding (decodeLatin1, encodeUtf8)
+import Data.Text.Encoding (decodeLatin1, decodeUtf8', encodeUtf8)
 import Data.Time.Clock (UTCTime)
 import Data.Type.Equality
 import Data.Typeable (Typeable)
+import qualified Data.Vector as V
 import Data.Word (Word32)
 import Database.SQLite.Simple.FromField (FromField (..))
 import Database.SQLite.Simple.ToField (ToField (..))
@@ -179,6 +190,53 @@ instance ToJSON SharedMsgId where
   toJSON = strToJSON
   toEncoding = strToJEncoding
 
+fromAeson :: J.Value -> MP.Object
+fromAeson = \case
+  J.Null -> MP.ObjectNil
+  J.Bool b -> MP.ObjectBool b
+  J.Number s -> case floatingOrInteger s of
+    Left f -> MP.ObjectDouble f
+    Right n -> MP.ObjectInt n
+  J.String t -> MP.ObjectStr t
+  J.Array v -> MP.ObjectArray $ V.map fromAeson v
+  J.Object o -> MP.ObjectMap $ V.fromList $ map (\(k, v) -> (MP.ObjectStr $ JK.toText k, fromAeson v)) $ JM.toList o
+
+toAeson :: MP.Object -> Either String J.Value
+toAeson = \case
+  MP.ObjectNil -> Right J.Null
+  MP.ObjectBool b -> Right $ J.Bool b
+  MP.ObjectInt n -> Right $ J.Number $ fromIntegral n
+  MP.ObjectWord n -> Right $ J.Number $ fromIntegral n
+  MP.ObjectFloat f -> Right $ J.Number $ realToFrac f
+  MP.ObjectDouble d -> Right $ J.Number $ realToFrac d
+  MP.ObjectStr t -> Right $ J.String t
+  MP.ObjectBin b -> bimap show J.String $ decodeUtf8' b
+  MP.ObjectArray v -> J.Array <$> V.mapM toAeson v
+  MP.ObjectMap m -> J.Object <$> toAesonObject m
+  MP.ObjectExt _ _  -> Left "unsupported object type"
+
+toAesonObject :: V.Vector (MP.Object, MP.Object) -> Either String J.Object
+toAesonObject m = JM.fromList . V.toList <$> V.mapM (\(k, v) -> (,) <$> fromKey k <*> toAeson v) m
+  where
+    fromKey = \case
+      MP.ObjectStr t -> Right $ JK.fromText t
+      MP.ObjectBin b -> bimap show JK.fromText $ decodeUtf8' b
+      _ -> Left "incompatible key object"
+
+(.=.) :: MessagePack a => Text -> a -> (MP.Object, MP.Object)
+k .=. v = (MP.ObjectStr k, toObject MP.defaultConfig v)
+
+(.=.?) :: MessagePack a => Text -> Maybe a -> [(MP.Object, MP.Object)] -> [(MP.Object, MP.Object)]
+k .=.? v = maybe id ((:) . (k .=.)) v
+
+(.:.) :: (MonadValidate MP.DecodeError m, MessagePack a) => Map Text MP.Object -> Text -> m a
+m .:. k = case M.lookup k m of
+  Just v -> fromObjectWith MP.defaultConfig v
+  Nothing -> refute . MP.decodeError $ "key not found: " <> T.unpack k
+
+(.:.?) :: (MonadValidate MP.DecodeError m, MessagePack a) => Map Text MP.Object -> Text -> m (Maybe a)
+m .:.? k = mapM (fromObjectWith MP.defaultConfig) (M.lookup k m)
+
 $(JQ.deriveJSON defaultJSON ''AppMessageJson)
 
 data MsgRef = MsgRef
@@ -213,6 +271,17 @@ instance ToJSON LinkContent where
   toEncoding = \case
     LCUnknown _ j -> JE.value $ J.Object j
     v -> $(JQ.mkToEncoding (taggedObjectJSON $ dropPrefix "LC") ''LinkContent) v
+
+instance MessagePack LinkContent where
+  toObject _ = fromAeson . J.toJSON
+  fromObjectWith _ = either (refute . MP.decodeError) pure . (JT.parseEither J.parseJSON <=< toAeson) <=< MP.fromObjectWith MP.defaultConfig
+
+instance MessagePack LinkPreview where
+  toObject _ LinkPreview {uri, title, description, image, content} =
+    MP.ObjectMap . V.fromList $ ("content" .=.? content) ["uri" .=. uri, "title" .=. title, "description" .=. description, "image" .=. image]
+  fromObjectWith _ d = do
+    o <- fromObjectWith MP.defaultConfig d
+    LinkPreview <$> o .:. "uri" <*> o .:. "title" <*> o .:. "description" <*> o .:. "image" <*> o .:.? "content"
 
 $(JQ.deriveJSON defaultJSON ''LinkPreview)
 
@@ -576,6 +645,52 @@ instance FromJSON MsgContent where
         pure MCUnknown {tag, text, json = v}
   parseJSON invalid =
     JT.prependFailure "bad MsgContent, " (JT.typeMismatch "Object" invalid)
+
+instance MessagePack MsgContentTag where
+  toObject _ = MP.ObjectStr . decodeLatin1 . strEncode
+  fromObjectWith _ = \case
+    MP.ObjectStr t -> either (refute . MP.decodeError) pure $ strDecode $ encodeUtf8 t
+    _ -> refute "invalid encoding for MsgContentTag"
+
+instance MessagePack MsgContent where
+  toObject _ = \case
+    MCUnknown {json} -> fromAeson $ J.Object json
+    MCText t -> o ["type" .=. MCText_, "text" .=. t]
+    MCLink {text, preview} -> o ["type" .=. MCLink_, "text" .=. text, "preview" .=. preview]
+    MCImage {text, image} -> o ["type" .=. MCImage_, "text" .=. text, "image" .=. image]
+    MCVideo {text, image, duration} -> o ["type" .=. MCVideo_, "text" .=. text, "image" .=. image, "duration" .=. duration]
+    MCVoice {text, duration} -> o ["type" .=. MCVoice_, "text" .=. text, "duration" .=. duration]
+    MCFile t -> o ["type" .=. MCFile_, "text" .=. t]
+    where
+      o = MP.ObjectMap
+  fromObjectWith _ = \case
+    v@(MP.ObjectMap m) -> do
+      o <- fromObjectWith MP.defaultConfig v
+      o .:. "type" >>= \case
+        MCText_ -> MCText <$> o .:. "text"
+        MCLink_ -> do
+          text <- o .:. "text"
+          preview <- o .:. "preview"
+          pure MCLink {text, preview}
+        MCImage_ -> do
+          text <- o .:. "text"
+          image <- o .:. "image"
+          pure MCImage {text, image}
+        MCVideo_ -> do
+          text <- o .:. "text"
+          image <- o .:. "image"
+          duration <- o .:. "duration"
+          pure MCVideo {text, image, duration}
+        MCVoice_ -> do
+          text <- o .:. "text"
+          duration <- o .:. "duration"
+          pure MCVoice {text, duration}
+        MCFile_ -> MCFile <$> o .:. "text"
+        MCUnknown_ tag -> do
+          text <- fromMaybe unknownMsgType <$> o .:.? "text"
+          json <- either (refute . MP.decodeError) pure $ toAesonObject m
+          pure MCUnknown {tag, text, json}
+    _ -> refute "invalid encoding for MsgContent"
 
 unknownMsgType :: Text
 unknownMsgType = "unknown message type"
